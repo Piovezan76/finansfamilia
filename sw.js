@@ -1,5 +1,5 @@
 /* FinansFamília — service worker: funcionamento offline */
-const CACHE = 'finansfamilia-v1';
+const CACHE = 'finansfamilia-v2';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -14,6 +14,8 @@ self.addEventListener('activate', e => {
 /* network-first para o index (pega atualizações), cache como fallback offline */
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
+  /* nunca interceptar chamadas à nuvem (Supabase) ou outros domínios */
+  if (!e.request.url.startsWith(self.location.origin)) return;
   e.respondWith(
     fetch(e.request).then(resp => {
       const copy = resp.clone();

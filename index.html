@@ -173,6 +173,21 @@
 
   .memwarn{background:rgba(250,178,25,.14);border:1px solid rgba(250,178,25,.5);border-radius:12px;padding:10px 14px;font-size:12.5px;margin-top:10px;display:none}
 
+  /* nuvem / login */
+  .gearbtn{width:32px;height:32px;border-radius:50%;border:1px solid var(--ring);background:var(--surface);font-size:15px;cursor:pointer;display:flex;align-items:center;justify-content:center;margin-left:8px}
+  .headright{display:flex;align-items:center}
+  .syncdot{font-size:10.5px;font-weight:700;padding:4px 9px;border-radius:99px;margin-left:8px;white-space:nowrap}
+  .syncdot.ok{background:rgba(12,163,12,.13);color:var(--goodtext)}
+  .syncdot.off{background:var(--grid);color:var(--muted)}
+  .syncdot.wait{background:rgba(250,178,25,.16);color:#8a6100}
+  .login-wrap{max-width:400px;margin:0 auto;padding-top:8vh;text-align:center}
+  .login-wrap .logo{font-size:52px}
+  .login-wrap h1{font-size:26px;font-weight:800;letter-spacing:-.03em;margin:8px 0 6px}
+  .login-wrap p{font-size:13.5px;color:var(--ink2);line-height:1.6;margin-bottom:18px}
+  .login-wrap .finput{margin-bottom:10px;text-align:left;padding:13px 14px;background:var(--surface)}
+  .login-note{font-size:12px;color:var(--muted);line-height:1.6;margin-top:14px}
+  .linklike{background:none;border:0;color:var(--accent);font:600 13px system-ui;cursor:pointer;margin-top:16px}
+
   /* desktop dashboard grid */
   .grid{display:block}
   @media(min-width:980px){
@@ -204,10 +219,17 @@
 <script>
 'use strict';
 /* ============================================================
-   FinansFamília — MVP (Fase 1)
-   Dados 100% locais no dispositivo (localStorage), com backup
-   e exportação. Nenhum dado sai do aparelho.
+   FinansFamília — Fase 2 (Nuvem da família)
+   Local-first: tudo funciona offline; as mudanças entram numa
+   fila e sincronizam com o Supabase (conta única da família,
+   protegida por senha + Row Level Security). Nenhuma senha
+   bancária em nenhum fluxo.
    ============================================================ */
+
+/* ---------- nuvem: configuração ---------- */
+const SB_URL='https://boxhpadiuomzlxykrjmu.supabase.co';        // preenchido na publicação
+const SB_KEY='sb_publishable_soPtF7-cYgzldnQNyUqf8Q_wEoRbImo';   // chave pública (anon) — segura para ficar no app
+const CLOUD_ENABLED = SB_URL.startsWith('http');
 
 /* ---------- armazenamento ---------- */
 const DB_KEY='finansfamilia_v1';
@@ -248,6 +270,162 @@ function save(){
   if(memoryOnly) return;
   try{localStorage.setItem(DB_KEY,JSON.stringify(D))}catch(e){memoryOnly=true;render()}
 }
+
+/* ============================================================
+   NUVEM DA FAMÍLIA (Supabase via REST — sem dependências)
+   ============================================================ */
+const SES_KEY='ff_session', QUEUE_KEY='ff_queue', CURSOR_KEY='ff_cursor', SKIP_KEY='ff_skipcloud';
+let session=null, syncState='off', syncTimer=null, flushing=false;
+function lsGet(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}}
+function lsSet(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}
+function queue(){return lsGet(QUEUE_KEY,[])}
+function setQueue(q){lsSet(QUEUE_KEY,q)}
+
+function setSync(s){ if(syncState!==s){ syncState=s; const el=document.getElementById('syncdot'); if(el){el.className='syncdot '+(s==='ok'?'ok':s==='wait'?'wait':'off'); el.textContent=syncLabel();} } }
+function syncLabel(){ return syncState==='ok'?'☁️ ✓':syncState==='wait'?'☁️ …':CLOUD_ENABLED&&session?'☁️ ✕':'☁️ local'; }
+function syncLabelFull(){ return syncState==='ok'?'☁️ Sincronizado agora há pouco':syncState==='wait'?'☁️ Sincronizando…':CLOUD_ENABLED&&session?'☁️ Sem conexão — as mudanças estão guardadas e serão enviadas quando a internet voltar':'☁️ Modo local (sem nuvem)'; }
+
+/* --- auth --- */
+async function sbAuth(path,body){
+  const r=await fetch(SB_URL+'/auth/v1/'+path,{method:'POST',
+    headers:{'apikey':SB_KEY,'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error_description||j.msg||j.message||('Erro '+r.status));
+  return j;
+}
+function storeSession(j){
+  if(!j||!j.access_token) return;
+  session={at:j.access_token,rt:j.refresh_token,exp:Date.now()+((j.expires_in||3600)-90)*1000,uid:(j.user&&j.user.id)||(session&&session.uid),email:(j.user&&j.user.email)||(session&&session.email)};
+  lsSet(SES_KEY,session);
+}
+async function ensureToken(){
+  if(!session) return null;
+  if(Date.now()<session.exp) return session.at;
+  try{ const j=await sbAuth('token?grant_type=refresh_token',{refresh_token:session.rt}); storeSession(j); return session.at; }
+  catch(e){ if(navigator.onLine){ session=null; localStorage.removeItem(SES_KEY); setSync('off'); render(); } return null; }
+}
+async function cloudLogin(email,pass,isSignup){
+  const j=isSignup? await sbAuth('signup',{email,password:pass})
+                  : await sbAuth('token?grant_type=password',{email,password:pass});
+  if(!j.access_token) throw new Error('Confirme o e-mail da conta e tente entrar de novo.');
+  storeSession(j);
+  localStorage.removeItem(SKIP_KEY);
+  // primeira sincronização: PRIMEIRO puxa o que já existe na nuvem (para não
+  // sobrescrever nomes/orçamentos da família com os padrões deste aparelho),
+  // depois envia o que só existe aqui.
+  lsSet(CURSOR_KEY,'1970-01-01T00:00:00Z');
+  setSync('wait');
+  try{ await pullChanges(); }catch(e){}
+  const q=queue();
+  D.txs.forEach(t=>{ if(!q.some(o=>o.tb==='txs'&&o.id===t.id)) q.push({tb:'txs',id:t.id}); });
+  if(!q.some(o=>o.tb==='config')) q.push({tb:'config'});
+  setQueue(q);
+  await syncNow();
+}
+function cloudLogout(){ session=null; localStorage.removeItem(SES_KEY); setSync('off'); toast('Você saiu da nuvem neste aparelho'); render(); }
+
+/* --- REST --- */
+async function sbFetch(path,opts){
+  const tk=await ensureToken(); if(!tk) throw new Error('sem sessão');
+  opts=opts||{}; opts.headers=Object.assign({'apikey':SB_KEY,'Authorization':'Bearer '+tk,'Content-Type':'application/json'},opts.headers||{});
+  const r=await fetch(SB_URL+'/rest/v1/'+path,opts);
+  if(!r.ok) throw new Error('REST '+r.status);
+  const txt=await r.text();
+  return txt?JSON.parse(txt):null;
+}
+
+/* --- fila de mudanças --- */
+function pushTx(t){ if(!CLOUD_ENABLED) return; const q=queue(); if(!q.some(o=>o.tb==='txs'&&o.id===t.id&&!o.del)) q.push({tb:'txs',id:t.id}); setQueue(q); syncSoon(); }
+function pushDelTx(id){ if(!CLOUD_ENABLED) return; const q=queue().filter(o=>!(o.tb==='txs'&&o.id===id)); q.push({tb:'txs',id,del:1}); setQueue(q); syncSoon(); }
+function pushConfig(){ if(!CLOUD_ENABLED) return; const q=queue(); if(!q.some(o=>o.tb==='config')) q.push({tb:'config'}); setQueue(q); syncSoon(); }
+let soonT=null;
+function syncSoon(){ clearTimeout(soonT); soonT=setTimeout(syncNow,900); }
+
+async function flushQueue(){
+  if(flushing||!session) return; flushing=true;
+  try{
+    let q=queue();
+    while(q.length){
+      const ups=[],dels=[];
+      let cfg=false;
+      q.forEach(o=>{ if(o.tb==='config'){cfg=true;return}
+        if(o.del){dels.push(o.id);return}
+        const t=D.txs.find(x=>x.id===o.id); if(t) ups.push({id:t.id,family_id:session.uid,data:t,deleted:false});
+      });
+      if(ups.length) await sbFetch('txs?on_conflict=id',{method:'POST',headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(ups)});
+      if(dels.length) await sbFetch('txs?on_conflict=id',{method:'POST',headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},
+        body:JSON.stringify(dels.map(id=>({id,family_id:session.uid,data:{id},deleted:true})))});
+      if(cfg) await sbFetch('config?on_conflict=family_id',{method:'POST',headers:{'Prefer':'resolution=merge-duplicates,return=minimal'},
+        body:JSON.stringify([{family_id:session.uid,data:{people:D.people,cats:D.cats,budgets:D.budgets,rules:D.rules}}])});
+      const done=q.length; q=queue().slice(done); setQueue(q);
+    }
+  } finally { flushing=false; }
+}
+async function pullChanges(){
+  if(!session) return false;
+  const cursor=lsGet(CURSOR_KEY,'1970-01-01T00:00:00Z');
+  const rows=await sbFetch('txs?select=id,data,deleted,updated_at&updated_at=gt.'+encodeURIComponent(cursor)+'&order=updated_at.asc&limit=1000');
+  let changed=false, maxTs=cursor;
+  (rows||[]).forEach(r=>{
+    if(r.updated_at>maxTs) maxTs=r.updated_at;
+    const i=D.txs.findIndex(t=>t.id===r.id);
+    if(r.deleted){ if(i>=0){D.txs.splice(i,1);changed=true} }
+    else { const nt=r.data;
+      if(i>=0){ if(JSON.stringify(D.txs[i])!==JSON.stringify(nt)){D.txs[i]=nt;changed=true} }
+      else { D.txs.push(nt); changed=true } }
+  });
+  const cfgRows=await sbFetch('config?select=data,updated_at&updated_at=gt.'+encodeURIComponent(cursor));
+  (cfgRows||[]).forEach(r=>{
+    if(r.updated_at>maxTs) maxTs=r.updated_at;
+    const c=r.data||{};
+    if(c.people&&JSON.stringify(c.people)!==JSON.stringify(D.people)){D.people=c.people;changed=true}
+    if(c.cats&&JSON.stringify(c.cats)!==JSON.stringify(D.cats)){D.cats=c.cats;changed=true}
+    if(c.budgets&&JSON.stringify(c.budgets)!==JSON.stringify(D.budgets)){D.budgets=c.budgets;changed=true}
+    if(c.rules&&JSON.stringify(c.rules)!==JSON.stringify(D.rules)){D.rules=c.rules;changed=true}
+  });
+  lsSet(CURSOR_KEY,maxTs);
+  if(changed){ save(); if(!document.getElementById('sheet').classList.contains('open')) render(); }
+  return changed;
+}
+async function syncNow(){
+  if(!CLOUD_ENABLED||!session){ setSync('off'); return; }
+  if(!navigator.onLine){ setSync('off'); return; }
+  setSync('wait');
+  try{ await flushQueue(); await pullChanges(); setSync('ok'); }
+  catch(e){ setSync('off'); }
+}
+function initCloud(){
+  if(!CLOUD_ENABLED) return;
+  session=lsGet(SES_KEY,null);
+  if(session){ syncNow(); }
+  document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') syncNow(); });
+  window.addEventListener('online',syncNow);
+  syncTimer=setInterval(()=>{ if(document.visibilityState==='visible') syncNow(); },45000);
+}
+
+/* --- tela de entrada --- */
+function loginScreen(){
+  return `<div class="login-wrap">
+    <div class="logo">👨‍👩‍👧💙</div>
+    <h1>FinansFamília</h1>
+    <p>Entre na <b>nuvem da família</b> para que os lançamentos apareçam no seu iPhone, no da sua esposa e no PC — tudo junto, em segundos.</p>
+    <input class="finput" id="lgEmail" type="email" autocomplete="username" placeholder="E-mail da família">
+    <input class="finput" id="lgPass" type="password" autocomplete="current-password" placeholder="Senha">
+    <button class="save" onclick="doLogin(false)">Entrar</button>
+    <button class="btn2" onclick="doLogin(true)">Criar a conta da família (primeira vez)</button>
+    <div class="login-note">🔒 Uma conta só para o casal: usem o <b>mesmo e-mail e senha</b> nos dois celulares e no PC.<br>Nenhuma senha de banco é pedida — nunca.</div>
+    <button class="linklike" onclick="skipCloud()">Usar sem nuvem neste aparelho →</button>
+  </div>`;
+}
+async function doLogin(isSignup){
+  const em=$('lgEmail').value.trim(), pw=$('lgPass').value;
+  if(!em||!em.includes('@')){toast('Digite o e-mail da família 🙂');return}
+  if(!pw||pw.length<8){toast('A senha precisa ter pelo menos 8 caracteres');return}
+  toast(isSignup?'Criando a conta…':'Entrando…');
+  try{ await cloudLogin(em,pw,isSignup); screen='home'; render(); toast('☁️ Nuvem da família conectada!'); }
+  catch(e){ toast('😕 '+(e.message||'Não deu certo — confira e-mail e senha')); }
+}
+function skipCloud(){ lsSet(SKIP_KEY,1); screen='home'; render(); }
 
 /* ---------- helpers ---------- */
 const $=id=>document.getElementById(id);
@@ -373,6 +551,11 @@ function txRow(t){
     <div class="s">${esc(c.n)}${t.pay?' · '+esc(t.pay):''}${t.parcela?' · '+t.parcela:''}</div></div>
     <div class="txval"><div class="v ${inc?'in':''}">${inc?'+':'−'} ${brl(t.v)}</div><div class="who">${esc(p.n)} · ${fmtD(t.date)}</div></div></div>`;
 }
+function headExtra(withAvatars){
+  const dot=CLOUD_ENABLED?`<span class="syncdot ${syncState==='ok'?'ok':syncState==='wait'?'wait':'off'}" id="syncdot" onclick="syncNow()">${syncLabel()}</span>`:'';
+  const avs=withAvatars?`<div class="avatars" onclick="go('config')" title="Ajustes">${D.people.map(p=>`<span class="av" style="background:${p.c}">${esc(p.n[0]||'?')}</span>`).join('')}</div>`:'';
+  return `<div class="headright">${dot}${avs}<button class="gearbtn" onclick="go('config')" title="Ajustes">⚙️</button></div>`;
+}
 function memWarnHTML(){
   return memoryOnly?`<div class="memwarn" style="display:block">⚠️ Este modo de visualização não guarda dados ao fechar. Publique o app (veja o guia) ou abra o arquivo no navegador para ter salvamento automático.</div>`:'';
 }
@@ -397,8 +580,7 @@ function homeScreen(){
   const insight=makeInsight(byCat);
   const greet=D.people[0]?`Olá, ${esc(D.people[0].n.split(' ')[0])} 👋`:'Olá 👋';
   return `
-  <div class="apphead"><div class="t">${greet}</div>
-    <div class="avatars" onclick="go('config')" title="Configurações">${D.people.map(p=>`<span class="av" style="background:${p.c}">${esc(p.n[0]||'?')}</span>`).join('')}</div></div>
+  <div class="apphead"><div class="t">${greet}</div>${headExtra(true)}</div>
   ${chipsHTML()}${memWarnHTML()}
   <div class="grid">
     <div class="card gd6"><div class="hero-label">Saldo do mês · ${monthLabel(curMonth).toLowerCase()}</div>
@@ -441,7 +623,7 @@ function txScreen(){
   const days={};
   list.forEach(t=>{(days[t.date]=days[t.date]||[]).push(t)});
   const dayKeys=Object.keys(days).sort().reverse();
-  let html=`<div class="apphead"><div class="t">Lançamentos</div></div>${chipsHTML()}
+  let html=`<div class="apphead"><div class="t">Lançamentos</div>${headExtra()}</div>${chipsHTML()}
   <div class="searchbar"><input id="txq" type="search" placeholder="🔍 Buscar por descrição ou categoria…" value="${esc(txSearch)}" oninput="txSearch=this.value;refreshTxList()"></div>
   <div id="txlist">`;
   html+=txListHTML(dayKeys,days);
@@ -460,7 +642,7 @@ function refreshTxList(){
 }
 
 function concScreen(){
-  let html=`<div class="apphead"><div class="t">Extratos</div></div>`;
+  let html=`<div class="apphead"><div class="t">Extratos</div>${headExtra()}</div>`;
   if(pendingImport){ html+=importResultHTML(); }
   else {
     const nConc=D.txs.filter(t=>t.conc).length;
@@ -513,7 +695,7 @@ function budScreen(){
       ${lim?`<div style="margin-top:6px">${budgetBar(c.id,spent).replace('class="budget-row"','class="budget-row" style="margin-top:0"')}</div>`:`<div class="sd">gasto no mês: ${brl0(spent)}</div>`}</div>
       <input type="number" inputmode="decimal" placeholder="teto R$" value="${lim}" onchange="setBudget('${c.id}',this.value)"></div>`;
   }).join('');
-  return `<div class="apphead"><div class="t">Orçamento</div></div>${chipsHTML()}
+  return `<div class="apphead"><div class="t">Orçamento</div>${headExtra()}</div>${chipsHTML()}
   <div class="grid">
   <div class="card gd6"><h3>Evolução · receitas × despesas</h3>
     <div class="chart-legend"><span class="lg"><span class="sw" style="background:var(--s1)"></span>Receitas</span><span class="lg"><span class="sw" style="background:var(--s2)"></span>Despesas</span></div>
@@ -526,29 +708,37 @@ function budScreen(){
 function configScreen(){
   const ppl=D.people.map((p,i)=>`<div class="setrow"><div><div class="sl"><span class="av" style="background:${p.c};display:inline-flex;width:24px;height:24px;font-size:11px;vertical-align:middle;margin-right:6px">${esc(p.n[0]||'?')}</span> Membro ${i+1}</div></div>
     <input type="text" value="${esc(p.n)}" onchange="renamePerson(${i},this.value)"></div>`).join('');
-  return `<div class="apphead"><div class="t">Configurações</div></div>
+  const cloudCard=CLOUD_ENABLED?`<div class="card"><h3>☁️ Nuvem da família</h3>
+    ${session?`<div style="font-size:13px;color:var(--ink2);line-height:1.7">Conectado como <b>${esc(session.email||'família')}</b>.<br><span id="syncfull">${syncLabelFull()}</span><br>Os lançamentos sincronizam entre todos os aparelhos que entrarem com esse mesmo e-mail e senha.</div>
+      <button class="btn2" onclick="syncNow();toast('☁️ Sincronizando…')">🔄 Sincronizar agora</button>
+      <button class="btn2 danger" onclick="cloudLogout()">Sair da nuvem neste aparelho</button>`
+    :`<div style="font-size:13px;color:var(--ink2);line-height:1.7">Este aparelho está no modo local. Entre na nuvem para ver os mesmos dados no iPhone, no celular da sua esposa e no PC.</div>
+      <button class="btn2" onclick="localStorage.removeItem('ff_skipcloud');screen='login';render()">☁️ Entrar na nuvem da família</button>`}</div>`:'';
+  return `<div class="apphead"><div class="t">Ajustes</div></div>
+  ${cloudCard}
   <div class="card"><h3>👨‍👩‍👧 Família</h3>${ppl}</div>
   <div class="card"><h3>📤 Planilha e backup</h3>
     <button class="btn2" onclick="exportCSV()">⬇️ Exportar lançamentos (CSV — abre no Excel/Google Sheets)</button>
     <button class="btn2" onclick="exportResumoCSV()">⬇️ Exportar resumo mensal (CSV)</button>
     <button class="btn2" onclick="backupJSON()">💾 Backup completo (JSON)</button>
     <button class="btn2" onclick="$('restoreInput').click()">📥 Restaurar backup (JSON)</button>
-    <div style="font-size:12px;color:var(--muted);margin-top:8px">Sincronização automática com Google Sheets chega na Fase 2. Por enquanto, o CSV abre direto no Excel e pode ser importado no Google Sheets (Arquivo → Importar).</div></div>
+    <div style="font-size:12px;color:var(--muted);margin-top:8px">O CSV abre direto no Excel e pode ser importado no Google Sheets (Arquivo → Importar). A alimentação automática da planilha Google é a próxima etapa da Fase 2.</div></div>
   <div class="card"><h3>📱 Instalar no iPhone e no PC</h3>
     <div style="font-size:13px;color:var(--ink2);line-height:1.7">
     <b>iPhone:</b> abra este endereço no <b>Safari</b> → botão Compartilhar <span style="font-size:15px">⬆️</span> → <b>"Adicionar à Tela de Início"</b>. O app abre em tela cheia, com ícone.<br>
     <b>PC:</b> abra o mesmo endereço no Chrome/Edge → ícone de instalação na barra de endereço.<br>
-    <span style="color:var(--muted)">Os dados ficam salvos em cada dispositivo; use o backup JSON para levar de um aparelho a outro. Sincronização automática entre aparelhos chega na Fase 2.</span></div></div>
+    <span style="color:var(--muted)">Com a nuvem da família conectada, todos os aparelhos mostram os mesmos dados automaticamente.</span></div></div>
   <div class="card"><h3>🔒 Privacidade</h3>
-    <div style="font-size:13px;color:var(--ink2);line-height:1.6">Seus dados ficam apenas neste dispositivo. O app não envia nada para nenhum servidor e nunca pede senhas bancárias.</div>
+    <div style="font-size:13px;color:var(--ink2);line-height:1.6">Seus dados ficam neste aparelho e, se a nuvem estiver conectada, na conta protegida da família (Supabase, com regras que impedem qualquer outra pessoa de acessar). Nenhuma senha bancária é pedida — nunca.</div>
     <button class="btn2 danger" onclick="wipeAll()">🗑️ Apagar todos os dados</button></div>
-  <div style="text-align:center;color:var(--muted);font-size:11.5px;padding:16px 0">FinansFamília · Fase 1 (MVP) · dados locais</div>`;
+  <div style="text-align:center;color:var(--muted);font-size:11.5px;padding:16px 0">FinansFamília · Fase 2 · nuvem da família</div>`;
 }
 
 /* ---------- render ---------- */
 function render(){
-  const map={home:homeScreen,tx:txScreen,conc:concScreen,bud:budScreen,config:configScreen};
+  const map={home:homeScreen,tx:txScreen,conc:concScreen,bud:budScreen,config:configScreen,login:loginScreen};
   $('app').innerHTML=(map[screen]||homeScreen)();
+  document.querySelector('.tabbar').style.display=(screen==='login')?'none':'';
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('on',b.dataset.s===screen));
 }
 function go(s){screen=s;render();window.scrollTo(0,0)}
@@ -594,6 +784,7 @@ function saveTx(){
   const date=$('dateIn').value||todayISO();
   if(editing){
     Object.assign(editing,{v,desc,date,cat:selCat,who:selWho,pay:selPay,type:selType});
+    pushTx(editing);
     toast('✏️ Lançamento atualizado');
   } else {
     const parc=$('parcIn')?+$('parcIn').value:1;
@@ -602,11 +793,13 @@ function saveTx(){
       for(let i=0;i<parc;i++){
         const d=new Date(+date.slice(0,4),+date.slice(5,7)-1+i,+date.slice(8,10));
         const iso=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-        D.txs.push({id:uid(),date:iso,desc,cat:selCat,v:vp,type:selType,who:selWho,pay:selPay,conc:false,origin:'manual',parcela:(i+1)+'/'+parc});
+        const nt={id:uid(),date:iso,desc,cat:selCat,v:vp,type:selType,who:selWho,pay:selPay,conc:false,origin:'manual',parcela:(i+1)+'/'+parc};
+        D.txs.push(nt); pushTx(nt);
       }
       toast(`✅ ${parc} parcelas de ${brl(vp)} lançadas`);
     } else {
-      D.txs.push({id:uid(),date,desc,cat:selCat,v,type:selType,who:selWho,pay:selPay,conc:false,origin:'manual'});
+      const nt={id:uid(),date,desc,cat:selCat,v,type:selType,who:selWho,pay:selPay,conc:false,origin:'manual'};
+      D.txs.push(nt); pushTx(nt);
       toast('✅ Lançado!');
     }
     if(monthKey(date)!==curMonth) curMonth=monthKey(date);
@@ -615,7 +808,9 @@ function saveTx(){
 }
 function deleteTx(){
   if(!editing) return;
-  D.txs=D.txs.filter(t=>t.id!==editing.id);
+  const delId=editing.id;
+  D.txs=D.txs.filter(t=>t.id!==delId);
+  pushDelTx(delId);
   editing=null; save(); closeSheet(); render(); toast('🗑️ Excluído');
 }
 
@@ -719,7 +914,7 @@ function processStatement(name,text){
   const matchedIds=new Set(matched.map(m=>m.tx.id));
   const onlyApp=D.txs.filter(t=>t.type==='exp'&&!t.conc&&!matchedIds.has(t.id)&&t.date>=from&&t.date<=to).slice(0,8);
   // aplica conciliações imediatamente
-  matched.forEach(m=>{m.tx.conc=true;m.tx.hash=m.stmt.hash});
+  matched.forEach(m=>{m.tx.conc=true;m.tx.hash=m.stmt.hash;pushTx(m.tx)});
   save();
   pendingImport={name,matched,news,onlyApp,dupes};
   screen='conc';render();
@@ -730,8 +925,9 @@ function acceptNew(i){
   const cid=$('sel_'+i)?$('sel_'+i).value:m.sug;
   // aprender regra se o usuário escolheu manualmente uma categoria diferente da sugestão por palavra-chave
   const key=m.desc.split(/\s+/).slice(0,2).join(' ');
-  if(!m.isInc&&!D.rules.some(r=>r.pattern.toLowerCase()===key.toLowerCase())&&cid!=='outros') D.rules.push({pattern:key,catId:cid});
-  D.txs.push({id:uid(),date:m.date,desc:capitalize(m.desc),cat:cid,v:m.v,type:m.isInc?'inc':'exp',who:personFilter!=='all'?personFilter:D.people[0].id,pay:'Importado',conc:true,origin:'importado',hash:m.hash});
+  if(!m.isInc&&!D.rules.some(r=>r.pattern.toLowerCase()===key.toLowerCase())&&cid!=='outros'){D.rules.push({pattern:key,catId:cid});pushConfig()}
+  const nt={id:uid(),date:m.date,desc:capitalize(m.desc),cat:cid,v:m.v,type:m.isInc?'inc':'exp',who:personFilter!=='all'?personFilter:D.people[0].id,pay:'Importado',conc:true,origin:'importado',hash:m.hash};
+  D.txs.push(nt); pushTx(nt);
   m.done=true; save(); render(); toast('✅ Importado');
 }
 function acceptAll(){pendingImport.news.forEach((m,i)=>{if(!m.done)acceptNew(i)})}
@@ -770,16 +966,21 @@ function backupJSON(){download('finansfamilia_backup_'+todayISO()+'.json',JSON.s
 $('restoreInput').addEventListener('change',ev=>{
   const f=ev.target.files[0];if(!f)return;
   const r=new FileReader();
-  r.onload=()=>{try{const d=JSON.parse(r.result);if(!d.txs||!d.people)throw 0;D=d;save();render();toast('📥 Backup restaurado!')}catch(e){toast('Arquivo de backup inválido 😕')}};
+  r.onload=()=>{try{const d=JSON.parse(r.result);if(!d.txs||!d.people)throw 0;D=d;save();D.txs.forEach(pushTx);pushConfig();render();toast('📥 Backup restaurado!')}catch(e){toast('Arquivo de backup inválido 😕')}};
   r.readAsText(f);ev.target.value='';
 });
 
 /* ---------- configurações ---------- */
-function renamePerson(i,name){name=name.trim();if(!name)return;D.people[i].n=name;save();toast('✏️ Nome atualizado')}
-function setBudget(cid,v){const n=parseMoney(v);if(n===null||n<=0){delete D.budgets[cid]}else{D.budgets[cid]=n}save();render()}
+function renamePerson(i,name){name=name.trim();if(!name)return;D.people[i].n=name;save();pushConfig();toast('✏️ Nome atualizado')}
+function setBudget(cid,v){const n=parseMoney(v);if(n===null||n<=0){delete D.budgets[cid]}else{D.budgets[cid]=n}save();pushConfig();render()}
 function wipeAll(){
   if(!confirmWipe){confirmWipe=true;toast('Toque de novo para confirmar a exclusão de TUDO ⚠️');setTimeout(()=>confirmWipe=false,4000);return}
-  D=defaultData();save();render();toast('🗑️ Dados apagados');
+  setQueue([]); lsSet(CURSOR_KEY,new Date().toISOString());
+  if(session){ (async()=>{try{
+    await sbFetch('txs?family_id=eq.'+session.uid,{method:'DELETE',headers:{'Prefer':'return=minimal'}});
+    await sbFetch('config?family_id=eq.'+session.uid,{method:'DELETE',headers:{'Prefer':'return=minimal'}});
+  }catch(e){}})(); }
+  D=defaultData();save();render();toast('🗑️ Dados apagados (deste aparelho e da nuvem)');
 }
 let confirmWipe=false;
 
@@ -790,6 +991,8 @@ if('serviceWorker' in navigator && location.protocol==='https:'){
 
 /* ---------- boot ---------- */
 load();
+initCloud();
+if(CLOUD_ENABLED && !session && !lsGet(SKIP_KEY,0)) screen='login';
 render();
 </script>
 </body>
